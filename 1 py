@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+from pathlib import Path
+import gzip
+
+def run_cmd(cmd, check=True):
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        if check and result.returncode != 0:
+            print(f"ERROR running command: {' '.join(cmd)}")
+            print(result.stderr)
+            return result.returncode, result.stdout, result.stderr
+        return result.returncode, result.stdout, result.stderr
+    except FileNotFoundError:
+        print(f"Command not found: {cmd[0]}")
+        return 1, "", f"Command not found: {cmd[0]}"
+
+def find_bam_files(folder):
+    bam_files = []
+    for root, dirs, files in os.walk(folder):
+        for f in files:
+            if f.lower().endswith(".bam"):
+                bam_files.append(Path(root) / f)
+    return bam_files
+
+def bam_has_mapped_reads(bam_path, samtools_cmd):
+    cmd = [samtools_cmd, "view", "-c", "-F", "4", str(bam_path)]
+    ret, out, err = run_cmd(cmd, check=False)
+    if ret != 0:
+        print(f"Error checking BAM mapped reads: {err}")
+        return False
+    try:
+        count = int(out.strip())
+        return count > 0
+    except ValueError:
+        return False
+
+def extract_trids_from_vcf(vcf_path):
+    unique_ids = set()
+    try:
+        with gzip.open(vcf_path, 'rt') as f:
+            for line in f:
+                if line.startswith('#'):
+                    continue
+                fields = line.strip().split('\t')
+                if len(fields) > 7:
+                    info = fields[7]
+                    for entry in info.split(';'):
+                        if entry.startswith('TRID='):
+                            trid = entry.split('=')[1]
+                            unique_ids.add(trid)
+    except Exception as e:
+        print(f"Error reading VCF {vcf_path}: {e}")
+    return unique_ids
+
+def run_plot(trgt_cmd, genome, repeats, vcf, bam, trid, out_image, plot_type, show):
+    cmd = [
+        trgt_cmd, "plot",
+        "--genome", str(genome),
+        "--repeats", str(repeats),
+        "--vcf", str(vcf),
+        "--spanning-reads", str(bam),
+        "--repeat-id", trid,
+        "--image", str(out_image),
+        "--plot-type", plot_type,
+        "--show", show
+    ]
+    print(f"Running: {' '.join(cmd)}")
+    ret, out, err = run_cmd(cmd, check=False)
+    if ret != 0:
+        print(f"ERROR plotting {trid} ({plot_type} {show}): {err}")
+        return False, err
+    return True, ""
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Non-interactive TRGT pipeline")
+    parser.add_argument("--bamfolder", required=True, help="Folder with BAM files")
+    parser.add_argument("--reference", required=True, help="Reference FASTA")
+    parser.add_argument("--repeats", required=True, help="Repeats BED file")
+    parser.add_argument("--trgt", required=True, help="Path to trgt executable")
+    parser.add_argument("--outdir", required=True, help="Output root folder")
+    parser.add_argument("--samtools", default="samtools", help="samtools executable")
+    parser.add_argument("--bcftools", default="bcftools", help="bcftools executable")
+
+    args = parser.parse_args()
+
+    bam_folder = Path(args.bamfolder)
+    reference_fasta = Path(args.reference)
+    repeats_bed = Path(args.repeats)
+    trgt_cmd = args.trgt
+    output_root = Path(args.outdir)
+    samtools_cmd = args.samtools
+    bcftools_cmd = args.bcftools
+
+    output_root.mkdir(exist_ok=True, parents=True)
+
+    bam_files = find_bam_files(bam_folder)
+    if not bam_files:
+        print(f"No BAM files found in {bam_folder}. Exiting.")
+        sys.exit(1)
+    print(f"Found {len(bam_files)} BAM files.")
+
+    success_samples = []
+    failed_samples = []
+    sorted_samples = []
+    unsorted_samples = []
+    sorting_failures = []
+    failed_plots = {}
+    plot_failures = []
+
+    for bam_path in bam_files:
+        sample_name = bam_path.stem.replace(".happlotagged", "")
+        print("\n" + "="*50)
+        print(f"Processing sample: {sample_name}")
+        print("="*50)
+
+        sample_output = output_root / sample_name
+        sample_output.mkdir(exist_ok=True)
+
+        # Check BAM index
+        bam_index = bam_path.with_suffix(bam_path.suffix + ".bai")
+        if not bam_index.exists():
+            print(f"Index {bam_index} not found. Creating...")
+            ret, out, err = run_cmd([samtools_cmd, "index", str(bam_path)], check=False)
+            if ret != 0:
+                print(f"Failed to index BAM {bam_path}: {err}")
+                failed_samples.append((sample_name, "Failed BAM index"))
+                continue
+            print(f"BAM index created.")
+
+        # Check mapped reads
+        if not bam_has_mapped_reads(bam_path, samtools_cmd):
+            print(f"Sample {sample_name} has no mapped reads. Skipping.")
+            failed_samples.append((sample_name, "No mapped reads"))
+            continue
+
+        # Run trgt genotype
+        output_prefix = sample_output / sample_name
+        cmd_genotype = [
+            trgt_cmd, "genotype",
+            "--genome", str(reference_fasta),
+            "--reads", str(bam_path),
+            "--repeats", str(repeats_bed),
+            "--output-prefix", str(output_prefix),
+            "--sample-name", sample_name
+        ]
+        print(f"Running trgt genotype for {sample_name}...")
+        ret, out, err = run_cmd(cmd_genotype, check=False)
+        if ret != 0:
+            print(f"trgt genotype failed for {sample_name}: {err}")
+            failed_samples.append((sample_name, "trgt genotype failed"))
+            continue
+
+        vcf_unsorted = Path(str(output_prefix) + ".vcf.gz")
+        bam_spanning_unsorted = Path(str(output_prefix) + ".spanning.bam")
+
+        if not vcf_unsorted.exists() or not bam_spanning_unsorted.exists():
+            print(f"Missing genotype output files for {sample_name}, skipping.")
+            failed_samples.append((sample_name, "Missing genotype outputs"))
+            continue
+
+        # Sort VCF
+        vcf_sorted = Path(str(output_prefix) + ".sorted.vcf.gz")
+        ret, out, err = run_cmd([bcftools_cmd, "sort", "-Oz", "-o", str(vcf_sorted), str(vcf_unsorted)], check=False)
+        if ret != 0 or not vcf_sorted.exists():
+            print(f"VCF sorting failed for {sample_name}: {err.strip()}")
+            sorting_failures.append((sample_name, f"VCF sort failed: {err.strip()}"))
+            vcf_to_use = vcf_unsorted
+            unsorted_samples.append(sample_name)
+        else:
+            print(f"VCF sorted for {sample_name}. Indexing...")
+            ret, out, err = run_cmd([bcftools_cmd, "index", "-f", str(vcf_sorted)], check=False)
+            if ret != 0:
+                print(f"Warning: VCF indexing failed: {err.strip()}")
+            vcf_to_use = vcf_sorted
+            sorted_samples.append(sample_name)
+
+        # Sort BAM spanning
+        bam_spanning_sorted = Path(str(output_prefix) + ".spanning.sorted.bam")
+        ret, out, err = run_cmd([samtools_cmd, "sort", "-o", str(bam_spanning_sorted), str(bam_spanning_unsorted)], check=False)
+        if ret != 0 or not bam_spanning_sorted.exists():
+            print(f"BAM spanning sorting failed for {sample_name}: {err.strip()}")
+            sorting_failures.append((sample_name, f"BAM spanning sort failed: {err.strip()}"))
+            bam_to_use = bam_spanning_unsorted
+            if sample_name not in unsorted_samples:
+                unsorted_samples.append(sample_name)
+        else:
+            print(f"BAM spanning sorted for {sample_name}. Indexing...")
+            ret, out, err = run_cmd([samtools_cmd, "index", str(bam_spanning_sorted)], check=False)
+            if ret != 0:
+                print(f"Warning: BAM spanning index failed: {err.strip()}")
+            bam_to_use = bam_spanning_sorted
+            if sample_name not in sorted_samples:
+                sorted_samples.append(sample_name)
+
+        # Extract TRIDs
+        print(f"Extracting TRIDs for {sample_name}...")
+        trids = extract_trids_from_vcf(vcf_unsorted)
+        if not trids:
+            print(f"No TRIDs found for {sample_name}, skipping plotting.")
+            failed_samples.append((sample_name, "No TRIDs found"))
+            continue
+        print(f"Found {len(trids)} TRIDs.")
+
+        # Plotting
+        for trid in sorted(trids):
+            trid_folder = sample_output / trid
+            trid_folder.mkdir(exist_ok=True)
+            plot_patterns = [
+                ("allele", "motifs", f"{trid}_allele_motifs.png"),
+                ("allele", "meth", f"{trid}_allele_meth.png"),
+                ("waterfall", "motifs", f"{trid}_waterfall_motifs.png"),
+                ("waterfall", "meth", f"{trid}_waterfall_meth.png"),
+            ]
+            for plot_type, show, filename in plot_patterns:
+                out_img = trid_folder / filename
+                success, err = run_plot(trgt_cmd, reference_fasta, repeats_bed, vcf_to_use, bam_to_use, trid, out_img, plot_type, show)
+                if not success:
+                    failed_plots.setdefault(sample_name, []).append((trid, plot_type, show, err))
+                    plot_failures.append((sample_name, trid, plot_type, show, err))
+
+        if sample_name not in failed_plots:
+            success_samples.append(sample_name)
+        else:
+            print(f"Some plots failed for {sample_name}.")
+
+    # Final report
+    print("\n" + "="*80)
+    print("Pipeline finished. Report:\n")
+
+    if success_samples:
+        print("Samples successfully processed (all plots done):")
+        for s in sorted(success_samples):
+            print(f" - {s}")
+    else:
+        print("No samples completed all plots successfully.")
+
+    if sorted_samples:
+        print("\nSamples with sorted outputs created:")
+        for s in sorted(sorted_samples):
+            print(f" - {s}")
+    else:
+        print("No samples had sorted outputs.")
+
+    if unsorted_samples:
+        print("\nSamples processed using UNSORTED files:")
+        for s in sorted(set(unsorted_samples)):
+            print(f" - {s}")
+    else:
+        print("No samples used unsorted files.")
+
+    if sorting_failures:
+        print("\nSorting failures:")
+        for s, reason in sorting_failures:
+            print(f" - {s}: {reason}")
+
+    if failed_samples:
+        print("\nSamples failed completely:")
+        for s, reason in failed_samples:
+            print(f" - {s}: {reason}")
+
+    if failed_plots:
+        print("\nTRID plot failures:")
+        for sample, failures in failed_plots.items():
+            print(f"Sample '{sample}':")
+            for trid, ptype, show, err in failures:
+                errline = (err.strip().splitlines()[0] if err else "No stderr")
+                print(f"  TRID '{trid}' plot ({ptype} {show}) failed: {errline}")
+    else:
+        print("No TRID plot failures.")
+
+    print("\nSummary:")
+    print(f" - Total BAMs: {len(bam_files)}")
+    print(f" - Successful samples: {len(success_samples)}")
+    print(f" - Unsorted fallback samples: {len(set(unsorted_samples))}")
+    print(f" - Sorting failures: {len(sorting_failures)}")
+    print(f" - Completely failed samples: {len(failed_samples)}")
+    print(f" - Plot failures recorded: {len(plot_failures)}")
+
+    print("="*80)
+
+
+if __name__ == "__main__":
+    main()
